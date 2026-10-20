@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Gemini Usage Meter · Settings</title>
+  <link rel="stylesheet" href="options.css" />
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <img src="../icons/icon128.png" alt="" width="40" height="40" />
+      <div>
+        <h1>Gemini Usage Meter</h1>
+        <p class="sub">Settings · <span id="ver"></span> · by <a href="https://selectorshub.com/?utm_source=gemini-usage-meter&amp;utm_medium=options&amp;utm_campaign=more-tools" target="_blank" rel="noopener">SelectorsHub</a></p>
+      </div>
+    </header>
+
+    <section>
+      <h2>Usage strip</h2>
+      <label class="row"><input type="checkbox" id="stripEnabled" /><span><b>Show the strip above Gemini's chat box</b><small>5-hour and weekly usage, reset times and chat size, right where you type.</small></span></label>
+      <label class="row"><input type="checkbox" id="stripCollapsed" /><span><b>Start collapsed</b><small>Just the rings and percentages. Expand any time from the strip.</small></span></label>
+    </section>
+
+    <section>
+      <h2>Alerts</h2>
+      <label class="row"><input type="checkbox" id="notificationsEnabled" /><span><b>Desktop notifications</b><small>Alert when usage crosses the thresholds below.</small></span></label>
+      <div class="field">
+        <label for="thresholdsShort">5-hour limit thresholds (%)</label>
+        <input type="text" id="thresholdsShort" placeholder="75, 90, 100" />
+      </div>
+      <div class="field">
+        <label for="thresholdsWeekly">Weekly limit thresholds (%)</label>
+        <input type="text" id="thresholdsWeekly" placeholder="75, 90, 100" />
+      </div>
+      <label class="row"><input type="checkbox" id="forecastNotify" /><span><b>Heads-up when you're about to run out</b><small>One alert per window when your pace says you'll hit the limit within 30 minutes.</small></span></label>
+    </section>
+
+    <section>
+      <h2>Toolbar &amp; refresh</h2>
+      <div class="field">
+        <label for="badge">Toolbar badge shows</label>
+        <select id="badge">
+          <option value="max">Higher of 5-hour and weekly</option>
+          <option value="short">5-hour limit</option>
+          <option value="weekly">Weekly limit</option>
+          <option value="off">Nothing</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="pollMinutes">Check every (minutes)</label>
+        <input type="number" id="pollMinutes" min="1" max="60" step="1" />
+        <small>While a Gemini tab is open. With no Gemini tab open it checks at most every 5 minutes. The meter also updates instantly whenever Gemini refreshes its own usage, and right after each reply.</small>
+      </div>
+    </section>
+
+    <section>
+      <h2>How it works</h2>
+      <p class="note">The meter reads the same usage figures Gemini shows in <b>Settings › Usage limits</b>, using your signed-in Gemini session in this browser. Nothing is sent anywhere else, and no data leaves your browser. Chat size is an estimate counted from the conversation on the page.</p>
+    </section>
+
+    <div class="status" id="status"></div>
+  </div>
+  <script src="options.js"></script>
+</body>
+</html>

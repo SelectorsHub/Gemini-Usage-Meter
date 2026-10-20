@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Gemini Usage</title>
+  <link rel="stylesheet" href="popup.css" />
+  <link rel="stylesheet" href="tools.css" />
+</head>
+<body>
+  <header class="hdr">
+    <div class="hdr-left">
+      <img class="brand-logo" id="brand-logo" src="../icons/icon48.png" alt="" />
+      <div class="hdr-titles">
+        <h1>Gemini Usage Meter</h1>
+        <div class="hdr-sub" id="hdr-sub">by SelectorsHub</div>
+      </div>
+    </div>
+    <div class="hdr-right">
+      <button id="refresh-btn" class="icon-btn" title="Refresh now" aria-label="Refresh">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+      </button>
+      <button id="open-options" class="icon-btn" title="Settings" aria-label="Settings">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+      </button>
+    </div>
+  </header>
+
+  <main>
+    <div id="error-banner" class="banner hidden"></div>
+
+    <div class="toggle-row">
+      <div class="toggle-text">
+        <label class="toggle-lbl" for="show-strip">Show usage strip above Gemini chat</label>
+        <div class="toggle-sub" id="show-strip-sub">&nbsp;</div>
+      </div>
+      <label class="switch" title="Show or hide the usage strip on gemini.google.com">
+        <input type="checkbox" id="show-strip" role="switch" />
+        <span class="switch-track"><span class="switch-thumb"></span></span>
+      </label>
+    </div>
+
+    <section class="card" id="short-card">
+      <div class="row">
+        <span class="lbl">5-hour limit</span>
+        <span class="pct" id="short-pct">—</span>
+      </div>
+      <div class="bar"><div class="bar-fill" id="short-fill"></div></div>
+      <div class="sub" id="short-sub">Fetching…</div>
+      <div class="fc hidden" id="short-fc"></div>
+    </section>
+
+    <section class="card" id="weekly-card">
+      <div class="row">
+        <span class="lbl">Weekly limit</span>
+        <span class="pct" id="weekly-pct">—</span>
+      </div>
+      <div class="bar"><div class="bar-fill" id="weekly-fill"></div></div>
+      <div class="sub" id="weekly-sub">Fetching…</div>
+      <div class="fc hidden" id="weekly-fc"></div>
+    </section>
+
+    <section class="card hidden" id="counters-card">
+      <div class="row">
+        <span class="lbl">Per-feature limits</span>
+        <span class="info" tabindex="0">i<span class="tip">This account is metered per feature (common on Workspace and older plans). Gemini reports each limit by an internal id without a name, so they're listed by id. Your tightest one is shown in the strip.</span></span>
+      </div>
+      <div id="counters-list" class="counters"></div>
+      <button id="counters-more" class="link-btn hidden"></button>
+    </section>
+
+    <div id="meta" class="meta hidden"></div>
+
+    <div id="empty-hint" class="empty-hint hidden">
+      Open <a href="https://gemini.google.com/app" target="_blank" rel="noopener">gemini.google.com</a> and sign in, then click refresh.
+    </div>
+
+    <button id="fields-toggle" class="fields-toggle" aria-expanded="false" aria-controls="fields-panel">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"></line><line x1="4" y1="10" x2="4" y2="3"></line><line x1="12" y1="21" x2="12" y2="12"></line><line x1="12" y1="8" x2="12" y2="3"></line><line x1="20" y1="21" x2="20" y2="16"></line><line x1="20" y1="12" x2="20" y2="3"></line><line x1="1" y1="14" x2="7" y2="14"></line><line x1="9" y1="8" x2="15" y2="8"></line><line x1="17" y1="16" x2="23" y2="16"></line></svg>
+      <span class="fields-toggle-txt">Show in strip</span>
+      <svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+    </button>
+
+    <div id="fields-panel" class="fields-panel hidden">
+      <label class="field-row"><input type="checkbox" data-field="short" /><span>5-hour limit</span></label>
+      <label class="field-row"><input type="checkbox" data-field="weekly" /><span>Weekly limit</span></label>
+      <label class="field-row"><input type="checkbox" data-field="resetShort" /><span>5-hour reset time</span></label>
+      <label class="field-row"><input type="checkbox" data-field="resetWeekly" /><span>Weekly reset time</span></label>
+      <label class="field-row"><input type="checkbox" data-field="usageBars" /><span>Usage bars</span></label>
+      <label class="field-row"><input type="checkbox" data-field="forecast" /><span>Limit forecast</span>
+        <span class="info" tabindex="0">i<span class="tip">Shows &ldquo;~1h 20m left&rdquo; next to a limit only when you&rsquo;re on pace to hit it before it resets. It needs about 12 minutes of usage to measure your pace.</span></span></label>
+      <label class="field-row"><input type="checkbox" data-field="chatTokens" /><span>Chat size (tokens)</span></label>
+      <label class="field-row"><input type="checkbox" data-field="model" /><span>Current mode</span></label>
+      <label class="field-row"><input type="checkbox" data-field="feature" /><span>Per-feature limit (older plans)</span></label>
+      <div class="fields-sep"></div>
+      <label class="field-row"><input type="checkbox" data-setting="notificationsEnabled" /><span>Desktop notifications</span></label>
+    </div>
+
+    <div id="test-result" class="test-result hidden"></div>
+
+    <footer class="actions">
+      <button id="test-btn" class="btn-ghost">Test notification</button>
+      <button id="reset-btn" class="btn-ghost">Reset</button>
+    </footer>
+
+    <a id="rate-btn" class="btn-rate hidden" target="_blank" rel="noopener noreferrer">
+      <span>⭐️</span><span>Rate us</span>
+    </a>
+
+    <div id="sh-tools">
+      <button id="sh-tools-toggle" type="button" aria-expanded="false" aria-controls="sh-tools-grid">
+        <span class="sh-t-ico">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="5" r="1.9"/><circle cx="12" cy="5" r="1.9"/><circle cx="19" cy="5" r="1.9"/><circle cx="5" cy="12" r="1.9"/><circle cx="12" cy="12" r="1.9"/><circle cx="19" cy="12" r="1.9"/><circle cx="5" cy="19" r="1.9"/><circle cx="12" cy="19" r="1.9"/><circle cx="19" cy="19" r="1.9"/></svg>
+        </span>
+        <span class="sh-t-txt">More tools by SelectorsHub</span>
+        <span class="sh-t-chev">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+        </span>
+      </button>
+      <div id="sh-tools-grid"></div>
+      <a id="sh-tools-all" target="_blank" rel="noopener noreferrer">See all tools →</a>
+    </div>
+
+    <div class="updated" id="updated"></div>
+  </main>
+
+  <script src="popup.js"></script>
+</body>
+</html>
