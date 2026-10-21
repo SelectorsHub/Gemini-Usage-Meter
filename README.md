@@ -54,14 +54,20 @@ Gemini-Usage-Meter/
 └── icons/               Gauge icons; icons/tools/ for the SelectorsHub menu
 ```
 
-## Before publishing
+## Store links, welcome and goodbye pages (v1.0.1)
 
-`background.js` has placeholders that are `null` until the store listings exist:
+- Review page: the Chrome Web Store listing's `/reviews` page (`CHROME_REVIEW_URL`). Set `EDGE_REVIEW_URL` once the Edge Add-ons listing exists; until then Edge users are sent to the Chrome listing.
+- Welcome page on fresh install: `https://www.selectorshub.com/gemini-usage-meter-installed/`
+- Goodbye page on uninstall: `https://www.selectorshub.com/gemini-usage-meter-uninstalled/?v=<version>&b=<chrome|edge>&d=<days installed>`
 
-- `CHROME_REVIEW_URL` / `EDGE_REVIEW_URL`: turn on the "Rate us" button in the strip and popup.
-- `INSTALL_URL` / `UNINSTALL_URL`: welcome and goodbye pages.
+## Rating prompt (same concept as Claude Usage Meter)
 
-Outbound links carry `utm_source=gemini-usage-meter` with `utm_medium` = `logo-menu`, `logo-menu-all`, `popup` or `options`.
+- **Rate us button** in the strip, 2 days after install. Tooltip: "Pls Rate us & this button disappears forever after you review."
+- **Rating card** pointing at that button, from 3 days after install, then every 2 days until the person rates. 5 stars and "Write a review" open the review page; "Maybe later", × and Esc dismiss it. The button pulses while the card is open. It never covers another popover, waits until the tab is visible, and only one Gemini tab shows it.
+- **Rate us in the toolbar popup**, until rated.
+- Rating anywhere (`rate_us_clicked`) hides all three for good.
+
+**Test build:** set `PROMPT_TEST = true` in `background.js` and `RATE_TEST = true` in `content-script.js`. The button shows straight away, the card pops 3 seconds after Gemini loads and returns 1 minute after a dismissal, and every Reload in `chrome://extensions` resets the rating state. Set both back to `false` before packaging for the store.
 
 ## Caveats
 

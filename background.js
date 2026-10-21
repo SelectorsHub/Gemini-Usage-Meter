@@ -40,12 +40,18 @@ const ARGS_COMPUTE = JSON.stringify([[[1, 2]]]);
 const ARGS_ALL = "[]";
 const SHORT_WINDOW_MAX_MS = 6 * 60 * 60 * 1000;   // a reset further away than this is the weekly one
 
-// Store links. Fill these in once the listings exist; anything left null is
-// simply not shown (no "Rate us" button, no welcome / goodbye page).
-const CHROME_REVIEW_URL = null;   // e.g. "https://chromewebstore.google.com/detail/gemini-usage-meter/<id>/reviews"
-const EDGE_REVIEW_URL = null;
-const INSTALL_URL = null;         // e.g. "https://www.selectorshub.com/gemini-usage-meter-installed/"
-const UNINSTALL_URL = null;       // e.g. "https://www.selectorshub.com/gemini-usage-meter-uninstalled/"
+// Store and site links.
+const CHROME_REVIEW_URL = "https://chromewebstore.google.com/detail/gemini-usage-meter/mcdahaljogncagbhalakjnkgldplmoha/reviews";
+const EDGE_REVIEW_URL = null;     // set once the Edge Add-ons listing exists; Edge falls back to the Chrome listing
+const INSTALL_URL = "https://www.selectorshub.com/gemini-usage-meter-installed/";
+const UNINSTALL_URL = "https://www.selectorshub.com/gemini-usage-meter-uninstalled/";
+
+// ██ TEST BUILD — REVERT PROMPT_TEST to false before store packaging ██
+// Wipes the rating prompt state on every install, update or "Reload" in
+// chrome://extensions, so the rating flow can be replayed from the start.
+// Pair with RATE_TEST = true in content-script.js.
+const PROMPT_TEST = false;
+const PROMPT_TEST_KEYS = ["rate_us_clicked", "rate_us_clicked_at", "rate_nudge_at", "rate_nudge_dismissals", "install_at"];
 
 const DEFAULT_SETTINGS = {
   pollMinutes: DEFAULT_POLL_MINUTES,
@@ -565,8 +571,7 @@ async function broadcast() {
 }
 
 function reviewUrl() {
-  const ua = (self.navigator && navigator.userAgent) || "";
-  if (/Edg\//.test(ua) && EDGE_REVIEW_URL) return EDGE_REVIEW_URL;
+  if (EDGE_REVIEW_URL && isEdgeBrowser()) return EDGE_REVIEW_URL;
   return CHROME_REVIEW_URL;
 }
 
@@ -647,6 +652,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case "open_options":
         await chrome.runtime.openOptionsPage();
         return { ok: true };
+      case "open_review":
+        await openReview();
+        return { ok: true };
       case "rate_clicked":
         await setLocal({ [K.rated]: true });
         return { ok: true };
@@ -665,17 +673,65 @@ async function boot() {
   await updateBadge(usage, await getSettings());
 }
 
+function isEdgeBrowser() {
+  try {
+    const brands = navigator.userAgentData && navigator.userAgentData.brands;
+    if (Array.isArray(brands) && brands.some((b) => /edge/i.test(b.brand))) return true;
+  } catch (_) {}
+  try { return /Edg(e|A|iOS)?\//i.test(navigator.userAgent || ""); } catch (_) {}
+  return false;
+}
+
+// Uninstall feedback page: the browser opens it right after removal, with the
+// version, browser and days installed so feedback can be read in context.
+// Nothing else about the user is sent. Re-set on every worker start so the
+// "days installed" figure stays roughly current.
+async function setUninstallPage() {
+  try {
+    if (!UNINSTALL_URL || !chrome.runtime.setUninstallURL) return;
+    const p = new URLSearchParams({ v: chrome.runtime.getManifest().version, b: isEdgeBrowser() ? "edge" : "chrome" });
+    const installAt = await getLocal("install_at", 0);
+    if (installAt) p.set("d", String(Math.max(0, Math.floor((Date.now() - installAt) / 86400000))));
+    const r = chrome.runtime.setUninstallURL(UNINSTALL_URL + "?" + p.toString());
+    if (r && typeof r.catch === "function") r.catch(() => {});
+  } catch (_) {}
+}
+
+// Marks the user as having rated (first write of the timestamp wins) and opens
+// the store's review page. Shared by the strip button, the rating card and the
+// toolbar popup, so "Rate us" disappears everywhere at once.
+async function openReview() {
+  const patch = { [K.rated]: true };
+  const at = await getLocal("rate_us_clicked_at", 0);
+  if (!at) patch.rate_us_clicked_at = Date.now();
+  await setLocal(patch);
+  await chrome.tabs.create({ url: reviewUrl() });
+  await broadcast();
+}
+
 chrome.runtime.onInstalled.addListener(async (details) => {
+  if (PROMPT_TEST) {
+    try { await chrome.storage.local.remove(PROMPT_TEST_KEYS); } catch (_) {}
+  }
+  // Record the install time first so the Rate us gate always has a value. A
+  // fresh install starts the clock now; an update with no record counts as an
+  // existing user (0 = gate already passed). The test build treats every
+  // reload as a fresh install so the whole flow can be replayed.
+  try {
+    const installAt = await getLocal("install_at", undefined);
+    if (installAt === undefined) {
+      await setLocal({ install_at: (details.reason === "install" || PROMPT_TEST) ? Date.now() : 0 });
+    }
+  } catch (_) {}
+  await setUninstallPage();
   await boot();
   if (details.reason === "install" && INSTALL_URL) {
     try { chrome.tabs.create({ url: INSTALL_URL }); } catch (_) {}
   }
-  if (UNINSTALL_URL && chrome.runtime.setUninstallURL) {
-    try { chrome.runtime.setUninstallURL(UNINSTALL_URL + "?v=" + chrome.runtime.getManifest().version); } catch (_) {}
-  }
   pollUsage("install");
 });
-chrome.runtime.onStartup.addListener(() => { boot().then(() => pollUsage("startup")); });
+chrome.runtime.onStartup.addListener(() => { setUninstallPage(); boot().then(() => pollUsage("startup")); });
+setUninstallPage();
 
 // exported for tests (no-op in the extension)
 if (typeof module !== "undefined") module.exports = { parseRow, classifyCompute, mergeUsage, computeForecast, topCounter };

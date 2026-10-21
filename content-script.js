@@ -462,8 +462,8 @@
       if (top) segs.push(featureSeg(top));
       const cs = chatSeg(); if (cs) segs.push(cs);
       const ms = modelSeg(); if (ms) segs.push(ms);
-      const rate = state && state.reviewUrl
-        ? `<button class="gum-rate" data-act="rate" title="Enjoying the meter? A review helps a lot.">${ICON.star}<span>Rate us</span></button>` : "";
+      const rate = rateVisible()
+        ? `<button class="gum-rate" data-act="rate" title="Pls Rate us &amp; this button disappears forever after you review.">${ICON.star}<span>Rate us</span></button>` : "";
       body = `<button class="gum-logo" data-act="logo" title="Gemini Usage Meter · offered by SelectorsHub. Click to try more free tools from us.">${logoSvg(18, maxPct)}</button>
         <span class="gum-by">by SelectorsHub</span>
         ${segs.map((x, i) => (i ? '<span class="gum-sep"></span>' : '<span class="gum-sep gum-sep-first"></span>') + x).join("")}
@@ -478,6 +478,13 @@
       strip.__html = body;
     }
     fit();
+    // Keep the rating card attached to its button across re-renders.
+    const rb = strip.querySelector('[data-act="rate"]');
+    if (nudgeOpen) {
+      if (rb && rb.getClientRects().length) { rb.classList.add("gum-rate-pulse"); positionNudge(); }
+      else closeNudge(true);
+    }
+    scheduleNudge();
   }
 
   // ---------------------------------------------------------------------------
@@ -548,9 +555,8 @@
     else if (act === "logo") {
       if (e.ctrlKey || e.metaKey) window.open(withUtm(PRODUCT_URL, "logo"), "_blank", "noopener");
       else openToolsMenu(b);
-    } else if (act === "rate" && state && state.reviewUrl) {
-      window.open(state.reviewUrl, "_blank", "noopener");
-      send({ type: "rate_clicked" });
+    } else if (act === "rate") {
+      doRate();
     }
   }
 
@@ -666,6 +672,230 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Rating: the "Rate us" button and the rating card (same concept as
+  // Claude Usage Meter)
+  // ---------------------------------------------------------------------------
+  //   install          → no button, no card
+  //   +2d RATE_DELAY   → "Rate us" button appears in the strip
+  //   +3d NUDGE_FIRST  → rating card pops above the button, button pulses
+  //   dismissed        → card returns NUDGE_REPEAT (2 days) later
+  //   rated            → button AND card gone for good (strip, card or popup)
+  // The shown-at stamp (rate_nudge_at) is written the instant the card appears,
+  // so a second Gemini tab sees it via storage.onChanged and doesn't pop its own
+  // copy. Held back while the tab is hidden, while another popover is open and
+  // for a few seconds after load. installAt 0 = existing user from before the
+  // gate existed: the waits count as already served.
+  // ██ TEST BUILD — REVERT RATE_TEST to false before store packaging ██
+  const RATE_TEST = false;
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const RATE_DELAY = RATE_TEST ? 0 : 2 * DAY_MS;
+  const NUDGE_FIRST = RATE_TEST ? 0 : 3 * DAY_MS;
+  const NUDGE_REPEAT = RATE_TEST ? 60 * 1000 : 2 * DAY_MS;
+  const NUDGE_MOUNT_DELAY = RATE_TEST ? 3 * 1000 : 10 * 1000;
+  const RATE_KEY = "rate_us_clicked";
+  const NUDGE_KEY = "rate_nudge_at";
+  const NUDGE_DISMISS_KEY = "rate_nudge_dismissals";
+  const INSTALL_KEY = "install_at";
+  const CREATOR_URL = "https://www.linkedin.com/in/creator-sanjaykumar/";
+
+  let rateLoaded = false;
+  let rated = false;
+  let installAt = null;   // null = not loaded yet
+  let nudgeAt = 0;
+  let nudgeDismissals = 0;
+  let nudgeOpen = false;
+  let nudgeEl = null;
+  let nudgeTimer = null;
+  let nudgeHandlers = null;
+
+  function loadRateState() {
+    try {
+      chrome.storage.local.get([RATE_KEY, NUDGE_KEY, NUDGE_DISMISS_KEY, INSTALL_KEY], (o) => {
+        void chrome.runtime.lastError;
+        o = o || {};
+        rated = !!o[RATE_KEY];
+        installAt = typeof o[INSTALL_KEY] === "number" ? o[INSTALL_KEY] : 0;
+        nudgeAt = o[NUDGE_KEY] || 0;
+        nudgeDismissals = o[NUDGE_DISMISS_KEY] || 0;
+        rateLoaded = true;
+        if (strip) strip.__html = null;
+        render();
+      });
+      chrome.storage.onChanged.addListener((ch, area) => {
+        if (area !== "local") return;
+        let touched = false;
+        if (ch[RATE_KEY]) { rated = !!ch[RATE_KEY].newValue; touched = true; if (rated) closeNudge(true); }
+        if (ch[INSTALL_KEY]) { installAt = ch[INSTALL_KEY].newValue || 0; touched = true; }
+        if (ch[NUDGE_KEY]) {
+          nudgeAt = ch[NUDGE_KEY].newValue || 0;
+          // Another tab just showed the card: cancel ours.
+          if (!nudgeOpen && nudgeTimer) { clearTimeout(nudgeTimer); nudgeTimer = null; }
+          touched = true;
+        }
+        if (touched) { if (strip) strip.__html = null; render(); }
+      });
+    } catch (_) {}
+  }
+
+  function rateUnlocked() {
+    if (!rateLoaded || installAt === null) return false;
+    if (installAt === 0) return true;
+    return Date.now() - installAt >= RATE_DELAY;
+  }
+  function rateVisible() { return rateUnlocked() && !rated; }
+
+  function nudgeDue() {
+    if (!rateVisible()) return false;
+    if (installAt && Date.now() - installAt < NUDGE_FIRST) return false;
+    if (nudgeAt && Date.now() - nudgeAt < NUDGE_REPEAT) return false;
+    return true;
+  }
+
+  function scheduleNudge() {
+    if (nudgeTimer || nudgeOpen || !nudgeDue()) return;
+    nudgeTimer = setTimeout(() => { nudgeTimer = null; maybeShowNudge(); }, NUDGE_MOUNT_DELAY);
+  }
+
+  function rateButton() {
+    const b = strip && strip.isConnected ? strip.querySelector('[data-act="rate"]') : null;
+    return b && b.getClientRects().length && getComputedStyle(b).display !== "none" ? b : null;
+  }
+
+  function maybeShowNudge() {
+    if (nudgeOpen || !nudgeDue()) return;
+    if (document.hidden) { document.addEventListener("visibilitychange", onVisibleOnce); return; }
+    if (pop) { scheduleNudge(); return; }   // never on top of another popover
+    if (!rateButton()) return;              // collapsed, hidden or shed for width
+    showNudge();
+  }
+  function onVisibleOnce() {
+    if (document.hidden) return;
+    document.removeEventListener("visibilitychange", onVisibleOnce);
+    scheduleNudge();
+  }
+
+  function nudgeHtml() {
+    return `
+      <button class="gum-nudge-x" type="button" data-n="close" aria-label="Not now">×</button>
+      <div class="gum-nudge-title">Is Gemini Usage Meter helping you?</div>
+      <div class="gum-nudge-stars" data-n="stars" role="button" tabindex="0" aria-label="Leave a 5 star review">
+        <span>★</span><span>★</span><span>★</span><span>★</span><span>★</span>
+      </div>
+      <div class="gum-nudge-body">
+        Pls Rate us &amp; this button disappears forever after you review. 🙏🏻
+        <span class="gum-nudge-by">Thank you ~ <a href="${CREATOR_URL}" target="_blank" rel="noopener noreferrer">Sanjay</a>, Creator</span>
+      </div>
+      <div class="gum-nudge-actions">
+        <button class="gum-nudge-cta" type="button" data-n="rate">Write a review</button>
+        <button class="gum-nudge-later" type="button" data-n="later">Maybe later</button>
+      </div>`;
+  }
+
+  function positionNudge() {
+    const btn = rateButton();
+    if (!nudgeEl || !btn) return;
+    const br = btn.getBoundingClientRect();
+    const nr = nudgeEl.getBoundingClientRect();
+    const m = 8, vw = window.innerWidth;
+    let left = Math.max(m, Math.min(br.left + br.width / 2 - nr.width / 2, vw - nr.width - m));
+    let top;
+    if (br.top >= nr.height + 14) { top = br.top - nr.height - 10; nudgeEl.classList.remove("gum-below"); }
+    else { top = br.bottom + 10; nudgeEl.classList.add("gum-below"); }
+    const ax = Math.max(14, Math.min(br.left + br.width / 2 - left, nr.width - 14));
+    nudgeEl.style.setProperty("--gum-arrow-x", ax + "px");
+    nudgeEl.style.left = left + "px";
+    nudgeEl.style.top = top + "px";
+  }
+
+  function showNudge() {
+    nudgeOpen = true;
+    // Stamp first: other tabs cancel their pending card, and the repeat clock
+    // starts from the moment it was actually seen.
+    nudgeAt = Date.now();
+    try { chrome.storage.local.set({ [NUDGE_KEY]: nudgeAt }); } catch (_) {}
+
+    nudgeEl = document.createElement("div");
+    nudgeEl.className = "gum-nudge";
+    nudgeEl.dataset.theme = detectTheme();
+    nudgeEl.setAttribute("role", "dialog");
+    nudgeEl.setAttribute("aria-label", "Rate Gemini Usage Meter");
+    nudgeEl.innerHTML = nudgeHtml();
+    nudgeEl.style.visibility = "hidden";
+    document.body.appendChild(nudgeEl);
+    positionNudge();
+    nudgeEl.style.visibility = "";
+    requestAnimationFrame(() => { if (nudgeEl) nudgeEl.classList.add("gum-in"); });
+    const btn = rateButton();
+    if (btn) btn.classList.add("gum-rate-pulse");
+
+    nudgeEl.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const t = ev.target.closest("[data-n]");
+      const what = t && t.getAttribute("data-n");
+      if (what === "rate" || what === "stars") doRate();
+      else if (what === "later" || what === "close") closeNudge();
+    });
+    nudgeEl.querySelector('[data-n="stars"]').addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); doRate(); }
+    });
+
+    let queued = false;
+    const follow = () => {
+      if (queued) return;
+      queued = true;
+      requestAnimationFrame(() => { queued = false; positionNudge(); });
+    };
+    const outside = (ev) => { if (nudgeEl && !nudgeEl.contains(ev.target) && !ev.target.closest('[data-act="rate"]')) closeNudge(); };
+    const key = (ev) => { if (ev.key === "Escape") closeNudge(); };
+    nudgeHandlers = { follow, outside, key };
+    setTimeout(() => { if (nudgeHandlers) document.addEventListener("mousedown", outside, true); }, 0);
+    document.addEventListener("keydown", key, true);
+    window.addEventListener("resize", follow);
+    window.addEventListener("scroll", follow, true);
+  }
+
+  // silent = torn down for a reason that isn't the user saying "not now"
+  function closeNudge(silent) {
+    if (nudgeTimer) { clearTimeout(nudgeTimer); nudgeTimer = null; }
+    if (!nudgeOpen && !nudgeEl) return;
+    const wasOpen = nudgeOpen;
+    nudgeOpen = false;
+    if (wasOpen && !silent && !rated) {
+      nudgeDismissals += 1;
+      try { chrome.storage.local.set({ [NUDGE_DISMISS_KEY]: nudgeDismissals }); } catch (_) {}
+    }
+    if (nudgeHandlers) {
+      document.removeEventListener("mousedown", nudgeHandlers.outside, true);
+      document.removeEventListener("keydown", nudgeHandlers.key, true);
+      window.removeEventListener("resize", nudgeHandlers.follow);
+      window.removeEventListener("scroll", nudgeHandlers.follow, true);
+      nudgeHandlers = null;
+    }
+    if (nudgeEl) {
+      const el = nudgeEl;
+      nudgeEl = null;
+      el.classList.remove("gum-in");
+      setTimeout(() => el.remove(), 180);
+    }
+    const btn = strip && strip.querySelector('[data-act="rate"]');
+    if (btn) btn.classList.remove("gum-rate-pulse");
+  }
+
+  // The one "user rated" path, shared by the strip button and the card. The
+  // flag is written here as well as in the worker so the button never comes
+  // back even if the message fails.
+  function doRate() {
+    rated = true;
+    closeNudge(true);
+    try { chrome.storage.local.set({ [RATE_KEY]: true }); } catch (_) {}
+    send({ type: "open_review" }).then((r) => {
+      if (!r || r.error) { try { window.open(state && state.reviewUrl || "https://chromewebstore.google.com/detail/gemini-usage-meter/mcdahaljogncagbhalakjnkgldplmoha/reviews", "_blank", "noopener"); } catch (_) {} }
+    });
+    if (strip) strip.__html = null;
+    render();
+  }
+
+  // ---------------------------------------------------------------------------
   // Boot / observers
   // ---------------------------------------------------------------------------
   let lastPath = location.pathname;
@@ -690,6 +920,7 @@
 
   function start() {
     mo.observe(document.documentElement, { childList: true, subtree: true });
+    loadRateState();
     send({ type: "get_state" }).then((s) => {
       applyState(s);
       // Opening Gemini is the moment the numbers matter most: refresh if the

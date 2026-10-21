@@ -223,7 +223,14 @@
     r.textContent = "Alerts re-armed and the strip is visible again.";
     r.classList.remove("hidden");
   });
-  $("rate-btn").addEventListener("click", () => send({ type: "rate_clicked" }));
+  // Rate us: shown until the user rates anywhere (strip, card or here), then
+  // hidden forever. The worker records it and opens the review page.
+  $("rate-btn").addEventListener("click", async (e) => {
+    e.preventDefault();
+    $("rate-btn").classList.add("hidden");
+    await send({ type: "open_review" });
+    window.close();
+  });
 
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg && msg.type === "state" && msg.state) { state = msg.state; render(); }
