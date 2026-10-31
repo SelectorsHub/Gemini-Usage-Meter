@@ -32,17 +32,38 @@
   const ARGS_COMPUTE = JSON.stringify([[[1, 2]]]);
   const ARGS_ALL = "[]";
 
-  function post(type, payload) {
-    try { window.postMessage(Object.assign({ source: SRC_OUT, type }, payload || {}), location.origin); } catch (_) {}
+  // v1.0.3: WHO is signed in. The 21-digit Google user id (S06Grb) lives in the
+  // same WIZ_global_data object that supplies the XSRF / session tokens used for
+  // the call below, so the account and the call can never disagree. Nothing
+  // here looks at /u/N: the account is identified by its user id only.
+  function acctId() {
+    try {
+      const v = (window.WIZ_global_data || {}).S06Grb;
+      if (typeof v === "string" && /^\d{10,25}$/.test(v.trim())) return v.trim();
+    } catch (_) {}
+    return null;
   }
 
-  function authPrefix() {
-    const m = location.pathname.match(/^\/u\/(\d+)(?=\/|$)/);
-    return m ? m[0] : "";
+  // The page's RPC base (e.g. "/u/1/_/BardChatUi"), reported so the background's fallback request can address this
+  // same session later. It is only an address: the account is identified by S06Grb, never by this.
+  function rpcOrNull() {
+    try { return rpcBase(); } catch (_) { return null; }
   }
-  function authIndex() {
-    const m = location.pathname.match(/^\/u\/(\d+)(?=\/|$)/);
-    return m ? Number(m[1]) : 0;
+
+  function post(type, payload) {
+    try {
+      window.postMessage(Object.assign({ source: SRC_OUT, type, acct: acctId(), rpc: rpcOrNull() }, payload || {}), location.origin);
+    } catch (_) {}
+  }
+
+  // The batchexecute endpoint is the page's own RPC base (WIZ_global_data.Im6cmf).
+  // It is used verbatim: on /u/0/app it is "/u/0/_/BardChatUi", so the call goes to
+  // the same session the page is on, and this code never parses the path. If the
+  // page doesn't expose it, fail rather than guess a session.
+  function rpcBase() {
+    const b = (window.WIZ_global_data || {}).Im6cmf;
+    if (typeof b === "string" && b.startsWith("/")) return b.replace(/\/+$/, "");
+    throw new Error("no_rpc_base");
   }
 
   // ---- batchexecute response parsing -------------------------------------
@@ -102,7 +123,7 @@
       "f.req": JSON.stringify([[[RPC_QUOTA, args, null, "generic"]]]),
       at
     });
-    const res = await nativeFetch(authPrefix() + "/_/BardChatUi/data/batchexecute?" + qs.toString(), {
+    const res = await nativeFetch(rpcBase() + "/data/batchexecute?" + qs.toString(), {
       method: "POST",
       credentials: "include",
       headers: {
@@ -140,12 +161,12 @@
 
   function onQuotaText(text) {
     const { sawQuota, rows } = quotaRowsFrom(text);
-    if (sawQuota && rows.length) post("quota_sniffed", { rows, authuser: authIndex(), at: Date.now() });
+    if (sawQuota && rows.length) post("quota_sniffed", { rows, at: Date.now() });
   }
 
   let genActive = 0;
-  function genStart() { genActive++; post("gen_start", { authuser: authIndex() }); }
-  function genDone() { genActive = Math.max(0, genActive - 1); post("gen_done", { authuser: authIndex() }); }
+  function genStart() { genActive++; post("gen_start"); }
+  function genDone() { genActive = Math.max(0, genActive - 1); post("gen_done"); }
 
   window.fetch = function (input, init) {
     const u = urlOf(input);
@@ -189,13 +210,17 @@
     if (ev.source !== window) return;
     const d = ev.data;
     if (!d || d.source !== SRC_IN) return;
+    if (d.type === "get_acct") {
+      post("acct_result", { id: d.id });
+      return;
+    }
     if (d.type === "fetch_quota") {
       fetchQuota().then(
-        (r) => post("quota_result", { id: d.id, rows: r.rows, error: r.error, complete: r.complete, authuser: authIndex() }),
-        (e) => post("quota_result", { id: d.id, error: String((e && e.message) || e), authuser: authIndex() })
+        (r) => post("quota_result", { id: d.id, rows: r.rows, error: r.error, complete: r.complete }),
+        (e) => post("quota_result", { id: d.id, error: String((e && e.message) || e) })
       );
     }
   });
 
-  post("injector_ready", { authuser: authIndex() });
+  post("injector_ready");
 })();

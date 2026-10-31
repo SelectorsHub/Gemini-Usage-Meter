@@ -4,9 +4,10 @@
 //      - background asks "fetch_quota"  -> we ask the injector -> rows come back
 //      - the app fetches its own quota -> injector sniffs it -> we forward it
 //      - a reply finishes (StreamGenerate) -> we tell the worker and recount the chat
-//  * Reports page facts the worker can't see: account index (/u/N), the mode
-//    picker label (Fast / Thinking / Pro ...) and the plan badge (Plus / Pro /
-//    Ultra, "Work" for Workspace).
+//  * Reports page facts the worker can't see: the signed-in Google account (its
+//    21-digit user id, read by the injector), the mode picker label (Fast /
+//    Thinking / Pro ...) and the plan badge (Plus / Pro / Ultra, "Work" for
+//    Workspace).
 //  * Draws the usage strip just above Gemini's chat box.
 (() => {
   "use strict";
@@ -35,6 +36,12 @@
   // ---------------------------------------------------------------------------
   const pending = new Map();
   let reqSeq = 0;
+  // v1.0.3: the Google account this tab is signed in to (21-digit user id, read
+  // by the injector; null = not known yet). It is sent with every message so
+  // the worker files this tab's numbers under ITS account, never another one's.
+  let pageAcct = null;
+  let pageRpc = null;    // this page's RPC base: passed on so the worker's fallback can address this session
+  let acctAsked = 0;
 
   function askPage(type, timeoutMs) {
     return new Promise((resolve) => {
@@ -46,6 +53,7 @@
   }
 
   function send(msg) {
+    msg = Object.assign({ acct: pageAcct, rpc: pageRpc }, msg);
     return new Promise((resolve) => {
       try {
         chrome.runtime.sendMessage(msg, (r) => { void chrome.runtime.lastError; resolve(r); });
@@ -57,20 +65,27 @@
     if (ev.source !== window) return;
     const d = ev.data;
     if (!d || d.source !== SRC_IN) return;
+    if (d.rpc) pageRpc = d.rpc;
+    if (d.acct && d.acct !== pageAcct) {
+      pageAcct = d.acct;
+      reportPageInfo();
+    }
     switch (d.type) {
-      case "quota_result": {
+      case "quota_result":
+      case "acct_result": {
         const fn = pending.get(d.id);
         if (fn) { pending.delete(d.id); fn(d); }
         break;
       }
       case "quota_sniffed":
-        send({ type: "quota_sniffed", rows: d.rows, authuser: d.authuser });
+        send({ type: "quota_sniffed", rows: d.rows });
         break;
       case "gen_done":
         send({ type: "gen_done" });
         scheduleChatCount(1500);
         break;
       case "gen_start":
+      case "injector_ready":
         break;
     }
   });
@@ -79,7 +94,13 @@
     if (!msg) return;
     if (msg.type === "fetch_quota") {
       askPage("fetch_quota", 8000).then((d) => {
-        sendResponse({ rows: d.rows || null, error: d.rows ? null : (d.error || "no_rows"), complete: !!d.complete, authuser: d.authuser });
+        sendResponse({
+          rows: d.rows || null,
+          error: d.rows ? null : (d.error || "no_rows"),
+          complete: !!d.complete,
+          acct: d.acct || pageAcct,
+          rpc: d.rpc || pageRpc
+        });
       });
       return true;
     }
@@ -91,10 +112,6 @@
   // ---------------------------------------------------------------------------
   // Page facts
   // ---------------------------------------------------------------------------
-  function authIndex() {
-    const m = location.pathname.match(/^\/u\/(\d+)(?=\/|$)/);
-    return m ? Number(m[1]) : 0;
-  }
   function textOf(sel) {
     const el = document.querySelector(sel);
     return el ? (el.textContent || "").replace(/\s+/g, " ").trim() : "";
@@ -115,11 +132,26 @@
   }
 
   let lastInfoKey = "";
-  let pageInfo = { authuser: authIndex(), model: "", plan: null };
+  let pageInfo = { acct: null, model: "", plan: null };
+
+  // v1.0.3: ask the injector who is signed in (WIZ_global_data only exists in
+  // the page's own world, not in this one).
+  function refreshAcct() {
+    acctAsked = Date.now();
+    return askPage("get_acct", 1500).then((d) => {
+      const a = (d && d.acct) || null;
+      if (a && a !== pageAcct) {
+        pageAcct = a;
+        reportPageInfo();
+      }
+      return pageAcct;
+    });
+  }
+
   function reportPageInfo() {
     const plan = readPlan();
     const info = {
-      authuser: authIndex(),
+      acct: pageAcct,
       model: readModel() || pageInfo.model,
       plan: plan || pageInfo.plan
     };
@@ -300,6 +332,8 @@
 
   function applyState(s) {
     if (!s) return;
+    // A broadcast meant for a different Google account is not ours to show.
+    if (s.acct && pageAcct && s.acct !== pageAcct) return;
     state = s;
     render();
   }
@@ -889,7 +923,7 @@
     closeNudge(true);
     try { chrome.storage.local.set({ [RATE_KEY]: true }); } catch (_) {}
     send({ type: "open_review" }).then((r) => {
-      if (!r || r.error) { try { window.open(state && state.reviewUrl || "https://chromewebstore.google.com/detail/gemini-usage-meter/mcdahaljogncagbhalakjnkgldplmoha/reviews", "_blank", "noopener"); } catch (_) {} }
+      if (!r || r.error) { try { window.open(state && state.reviewUrl || (/Edg(e|A|iOS)?\//.test(navigator.userAgent) ? "https://microsoftedge.microsoft.com/addons/detail/gemini-usage-meter/mglfgpldcadhieaamfekmgjpcdllpmii" : "https://chromewebstore.google.com/detail/gemini-usage-meter/mcdahaljogncagbhalakjnkgldplmoha/reviews"), "_blank", "noopener"); } catch (_) {} }
     });
     if (strip) strip.__html = null;
     render();
@@ -910,8 +944,9 @@
         lastPath = location.pathname;
         chat = { id: chatIdFromUrl(), total: 0, you: 0, gemini: 0, images: 0, turns: 0 };
         scheduleChatCount(1200);
-        if (authIndex() !== pageInfo.authuser) reportPageInfo();
+        refreshAcct();
       }
+      if (!pageAcct && Date.now() - acctAsked > 5000) refreshAcct();
       if (!strip || !strip.isConnected) render();
       reportPageInfo();
       scheduleChatCount(2500);
@@ -921,7 +956,7 @@
   function start() {
     mo.observe(document.documentElement, { childList: true, subtree: true });
     loadRateState();
-    send({ type: "get_state" }).then((s) => {
+    refreshAcct().then(() => send({ type: "get_state" })).then((s) => {
       applyState(s);
       // Opening Gemini is the moment the numbers matter most: refresh if the
       // last reading is more than a minute old (the app's own quota call,
