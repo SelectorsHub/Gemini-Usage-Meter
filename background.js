@@ -19,11 +19,24 @@
 // --------------
 // Preferred: through an open gemini.google.com tab (page-injector.js makes the
 // call in the page with the page's own tokens). Fallback when no Gemini tab is
-// open: from here, after reading the tokens out of the /app HTML; a session
-// declarativeNetRequest rule gives those requests a gemini.google.com Origin.
+// open: from here, after reading the tokens (and the account id) out of the
+// /app HTML; a session declarativeNetRequest rule gives those requests a
+// gemini.google.com Origin.
 // The page also gets sniffed: whenever Gemini fetches its quota for itself, the
 // content script forwards the rows, so the meter moves the moment the app's
 // own badge would.
+//
+// Several accounts (v1.0.3)
+// -------------------------
+// One browser can hold several Google accounts at once, and a private window
+// can be signed in to yet another one. So an account is never identified by a
+// URL path or by the window: it is the 21-digit
+// Google user id (WIZ_global_data.S06Grb), read from the same page or /app
+// document that supplies the call tokens. Everything that belongs to "the
+// account" (usage, forecast history, alerts already fired, tokens) is stored
+// under that id, each tab remembers which account it is on, and a private
+// window is only ever read through a Gemini tab of that window. See "accounts
+// and windows" below.
 
 "use strict";
 
@@ -76,7 +89,42 @@ const DEFAULT_SETTINGS = {
   autoScroll: false
 };
 
-const K = {
+// ---- accounts and windows (v1.0.3) ------------------------------------------
+//
+// One extension instance serves two cookie jars (the normal window and a
+// private window) and, inside one jar, several Google accounts open in
+// different tabs. Each of them can show different numbers, so before this the
+// single set of keys below made a private window show the normal window's
+// account, and a second account in another tab overwrote the first.
+//
+//   CTX            "default" for the normal jar, otherwise "incognito" (or the
+//                  cookieStoreId where the browser exposes one). It exists to
+//                  keep the worker's own fetch, which always carries the NORMAL
+//                  jar's cookies, from ever running on behalf of another jar.
+//   CURRENT_ACCT   the 21-digit Google user id (WIZ_global_data.S06Grb) of the
+//                  tab or reading being processed.
+//   CURRENT_TAB    the tab being served, when there is one.
+//   inCtx(...)     runs a job with those three set, strictly one at a time (a
+//                  FIFO queue), so the code in between can keep reading K.* as
+//                  if there were only one account. Every entry point (alarm,
+//                  message, badge refresh) goes through it.
+//
+// Keys in chrome.storage.local come in three kinds:
+//   shared      user level, one copy: settings, rate_us_clicked,
+//               strip_dismissed_until
+//   account     everything that describes ONE account, stored as
+//               acct:<id>:<name> (usage, fired_thresholds, fc_history,
+//               bg_tokens), whichever window or tab it was seen from
+//   window      facts about one jar, not an account: page_info, last_error and
+//               window_acct, the last account active in that jar (used when the
+//               popup opens on a non-Gemini tab, or when polling with no Gemini
+//               tab open). The normal jar keeps the un-prefixed names, the
+//               others use ctx:<ctx>:<name>.
+let CTX = "default";
+let CURRENT_ACCT = null;
+let CURRENT_TAB = null;
+
+const BASE_K = {
   settings: "settings",
   usage: "usage",
   page: "page_info",
@@ -85,8 +133,285 @@ const K = {
   history: "fc_history",
   tokens: "bg_tokens",
   rated: "rate_us_clicked",
-  dismissedUntil: "strip_dismissed_until"
+  dismissedUntil: "strip_dismissed_until",
+  acct: "window_acct"
 };
+const SHARED_K = new Set(["settings", "rated", "dismissedUntil"]);
+const WINDOW_K = new Set(["page", "lastError", "acct"]);
+const windowKey = (ctx, base) => (ctx === "default" ? base : `ctx:${ctx}:${base}`);
+
+const K = {};
+for (const name of Object.keys(BASE_K)) {
+  Object.defineProperty(K, name, {
+    enumerable: true,
+    get() {
+      const base = BASE_K[name];
+      if (SHARED_K.has(name)) return base;
+      if (WINDOW_K.has(name)) return windowKey(CTX, base);
+      return `acct:${CURRENT_ACCT || "-"}:${base}`;
+    }
+  });
+}
+
+function ctxOfTab(tab) {
+  if (!tab) return "default";
+  const sid = tab.cookieStoreId;
+  if (sid) return (sid === "firefox-default" || sid === "0") ? "default" : String(sid);
+  return tab.incognito ? "incognito" : "default";
+}
+
+// Per-tab state, kept in memory and mirrored to storage so a service worker
+// restart doesn't forget which account each open tab is on.
+// tabId -> { acct, ctx, page, lastError }
+const TAB_STATE = new Map();
+const LAST_ACCT_BY_CTX = new Map();
+let tabStateLoaded = false;
+
+async function ensureTabStateLoaded() {
+  if (tabStateLoaded) return;
+  tabStateLoaded = true;
+  try {
+    const raw = await getLocal("session_tabs", null);
+    if (raw && typeof raw === "object") {
+      for (const [k, v] of Object.entries(raw)) {
+        const id = Number(k);
+        if (Number.isFinite(id) && v && typeof v === "object" && !TAB_STATE.has(id)) {
+          TAB_STATE.set(id, v);
+        }
+      }
+    }
+  } catch (_) {}
+}
+
+async function persistTabState() {
+  try {
+    const out = {};
+    for (const [id, st] of TAB_STATE.entries()) out[id] = st;
+    await setLocal({ session_tabs: out });
+  } catch (_) {}
+}
+
+function getTabEntry(tabId, ctx) {
+  if (tabId == null) return null;
+  let st = TAB_STATE.get(tabId);
+  if (!st) {
+    st = { acct: null, ctx: ctx || "default", page: {}, lastError: null };
+    TAB_STATE.set(tabId, st);
+  } else if (ctx) {
+    st.ctx = ctx;
+  }
+  return st;
+}
+
+async function acctForCtx(ctx) {
+  if (LAST_ACCT_BY_CTX.has(ctx)) return LAST_ACCT_BY_CTX.get(ctx);
+  const a = await getLocal(windowKey(ctx, BASE_K.acct), null);
+  if (a) LAST_ACCT_BY_CTX.set(ctx, a);
+  return a;
+}
+
+async function acctForTabOrCtx(tabId, ctx) {
+  await ensureTabStateLoaded();
+  if (tabId != null && TAB_STATE.has(tabId)) {
+    const st = TAB_STATE.get(tabId);
+    if (st && st.acct) return st.acct;
+  }
+  return acctForCtx(ctx);
+}
+
+// Before 1.0.3 usage / fired_thresholds / fc_history were stored un-prefixed.
+// The first time a real account is seen in the normal window, move them under
+// it (the old single-account data was the normal window's, so it is that
+// account's).
+const MIGRATED_ACCTS = new Set();
+async function migrateLegacyAccountState(acct) {
+  if (CTX !== "default" || !acct || /^x-/.test(acct) || MIGRATED_ACCTS.has(acct)) return;
+  MIGRATED_ACCTS.add(acct);
+  try {
+    const legacyKeys = ["usage", "fired", "history"].map((n) => BASE_K[n]);
+    const prefix = `acct:${acct}:`;
+    const got = await chrome.storage.local.get([...legacyKeys, prefix + BASE_K.usage]);
+    if (got[prefix + BASE_K.usage]) {
+      await chrome.storage.local.remove(legacyKeys);
+      return;
+    }
+    const legacy = got[BASE_K.usage];
+    if (!legacy) return;
+    const moved = {};
+    for (const k of legacyKeys) {
+      if (got[k] != null) {
+        if (k === BASE_K.usage && typeof got[k] === "object") {
+          const copy = Object.assign({}, got[k]);
+          delete copy.authuser;
+          copy.acct = acct;
+          moved[prefix + k] = copy;
+        } else {
+          moved[prefix + k] = got[k];
+        }
+      }
+    }
+    await chrome.storage.local.set(moved);
+    await chrome.storage.local.remove(legacyKeys);
+  } catch (_) {}
+}
+
+async function setCurrentAcct(acct, tabId) {
+  if (!acct) return;
+  CURRENT_ACCT = acct;
+  if (tabId != null) {
+    const st = getTabEntry(tabId, CTX);
+    st.acct = acct;
+    await persistTabState();
+  }
+  if (LAST_ACCT_BY_CTX.get(CTX) !== acct) {
+    LAST_ACCT_BY_CTX.set(CTX, acct);
+    await setLocal({ [windowKey(CTX, BASE_K.acct)]: acct });
+  }
+  await migrateLegacyAccountState(acct);
+}
+
+async function getPageInfoForCurrent() {
+  if (CURRENT_TAB != null && TAB_STATE.has(CURRENT_TAB)) {
+    const p = TAB_STATE.get(CURRENT_TAB).page;
+    if (p && Object.keys(p).length) return p;
+  }
+  if (CURRENT_ACCT) {
+    for (const st of TAB_STATE.values()) {
+      if (st.acct === CURRENT_ACCT && st.page && Object.keys(st.page).length) return st.page;
+    }
+  }
+  return getLocal(K.page, {});
+}
+
+async function setPageInfoForCurrent(info) {
+  if (CURRENT_TAB != null) {
+    const st = getTabEntry(CURRENT_TAB, CTX);
+    st.page = info;
+    await persistTabState();
+  }
+  await setLocal({ [K.page]: info });
+}
+
+async function getLastErrorForCurrent() {
+  if (CURRENT_TAB != null && TAB_STATE.has(CURRENT_TAB)) {
+    const st = TAB_STATE.get(CURRENT_TAB);
+    if (st.lastError !== undefined) return st.lastError;
+  }
+  if (CURRENT_ACCT) {
+    for (const st of TAB_STATE.values()) {
+      if (st.acct === CURRENT_ACCT && st.lastError !== undefined) return st.lastError;
+    }
+  }
+  return getLocal(K.lastError, null);
+}
+
+async function setLastErrorForCurrent(errObj) {
+  if (CURRENT_TAB != null) {
+    const st = getTabEntry(CURRENT_TAB, CTX);
+    st.lastError = errObj;
+  }
+  if (CURRENT_ACCT) {
+    for (const st of TAB_STATE.values()) {
+      if (st.acct === CURRENT_ACCT) st.lastError = errObj;
+    }
+  }
+  await persistTabState();
+  await setLocal({ [K.lastError]: errObj });
+}
+
+// Freeze guards: the queue is a single lane, so one job that never settles
+// would stall polling and every message for all windows. Each job has a hard
+// time limit, each request a shorter one, and a request that finishes after its
+// job was given up on is discarded (ctx_expired) so it can never write into the
+// account that runs next.
+const CTX_JOB_TIMEOUT_MS = 60 * 1000;     // longest a single queued job may hold the lane
+const CTX_FETCH_TIMEOUT_MS = 20 * 1000;   // longest a single request may take
+let ctxQueue = Promise.resolve();
+let RUN_ID = 0;
+let runSeq = 0;
+
+function inCtx(ctx, fn, opts) {
+  const tabId = opts && opts.tabId != null ? opts.tabId : null;
+  const explicitAcct = opts && opts.acct ? opts.acct : null;
+  const run = () => {
+    const myRun = ++runSeq;
+    RUN_ID = myRun;
+    CTX = ctx || "default";
+    CURRENT_TAB = tabId;
+    let timer = null;
+    const work = (async () => {
+      await ensureTabStateLoaded();
+      CURRENT_ACCT = explicitAcct || (await acctForTabOrCtx(tabId, CTX));
+      if (explicitAcct) await setCurrentAcct(explicitAcct, tabId);
+      else if (CURRENT_ACCT) await migrateLegacyAccountState(CURRENT_ACCT);
+      return await fn();
+    })();
+    const watchdog = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("ctx_job_timeout")), CTX_JOB_TIMEOUT_MS);
+    });
+    return Promise.race([work, watchdog]).finally(() => {
+      clearTimeout(timer);
+      if (RUN_ID !== myRun) return;
+      CTX = "default";
+      CURRENT_ACCT = null;
+      CURRENT_TAB = null;
+      RUN_ID = 0;
+    });
+  };
+  const p = ctxQueue.then(run, run);
+  ctxQueue = p.catch(() => {});
+  return p;
+}
+
+async function guardedFetch(url, init) {
+  const myRun = RUN_ID;
+  const ctl = typeof AbortController === "function" ? new AbortController() : null;
+  const timer = setTimeout(() => { try { ctl && ctl.abort(); } catch (_) {} }, CTX_FETCH_TIMEOUT_MS);
+  try {
+    const resp = await fetch(url, ctl ? { ...(init || {}), signal: ctl.signal } : init);
+    if (myRun && RUN_ID !== myRun) throw new Error("ctx_expired");
+    return resp;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function activeCtxs() {
+  const set = new Set(["default"]);
+  try {
+    for (const t of await geminiTabs()) set.add(ctxOfTab(t));
+  } catch (_) {}
+  return [...set];
+}
+
+// Poll every distinct account open across all Gemini tabs (several accounts in
+// one window included), plus the normal window's direct fallback when it has no
+// Gemini tab of its own.
+async function pollAll() {
+  await ensureTabStateLoaded();
+  const tabs = await geminiTabs();
+  const jobs = [];
+  const seenAcctInCtx = new Set();
+  let hasDefaultTab = false;
+
+  // Prefer active tabs first so the visible tab in each window is polled first.
+  const sorted = tabs.slice().sort((a, b) => (b.active ? 1 : 0) - (a.active ? 1 : 0));
+  for (const t of sorted) {
+    const c = ctxOfTab(t);
+    if (c === "default") hasDefaultTab = true;
+    const knownAcct = TAB_STATE.get(t.id) && TAB_STATE.get(t.id).acct;
+    const dedupeKey = knownAcct ? `${c}:acct:${knownAcct}` : `${c}:tab:${t.id}`;
+    if (seenAcctInCtx.has(dedupeKey)) continue;
+    seenAcctInCtx.add(dedupeKey);
+    jobs.push(inCtx(c, () => pollUsage("poll", t.id), { tabId: t.id, acct: knownAcct || null }));
+  }
+
+  if (!hasDefaultTab) {
+    jobs.push(inCtx("default", () => pollUsage("poll", null)));
+  }
+
+  await Promise.all(jobs);
+}
 
 // ---- storage helpers --------------------------------------------------------
 async function getLocal(key, fallback) {
@@ -163,17 +488,18 @@ function classifyCompute(rows, now) {
 
 // Merge a fresh batch of rows into the stored usage. A sniffed page response
 // may cover only some contexts, so per-feature counters merge by key and the
-// compute meter is replaced only by a batch that carries it.
+// compute meter is replaced only by a batch that carries it. `prev` is read
+// from this account's own key (acct:<id>:usage), so it always belongs to the
+// same account and nothing has to be compared.
 function mergeUsage(prev, rawRows, meta, now) {
   const rows = (rawRows || []).map(parseRow).filter(Boolean);
   // meta.full: the batch is a complete reading (both of our calls), so it
   // replaces what we had. Sniffed page responses are partial and merge.
-  const sameAccount = prev && prev.authuser === meta.authuser;
-  const keep = sameAccount && !meta.full;
+  const keep = !!prev && !meta.full;
   const next = {
     fetchedAt: now,
     source: meta.source,
-    authuser: meta.authuser != null ? meta.authuser : (prev && prev.authuser) || 0,
+    acct: (meta && meta.acct) || (prev && prev.acct) || CURRENT_ACCT || null,
     compute: keep ? prev.compute : null,
     counters: {}
   };
@@ -310,15 +636,18 @@ async function maybeNotify(usage, forecast, settings) {
       const msg = t >= 100
         ? `You've used all of your Gemini ${label.toLowerCase()}. It resets in ${fmtReset(w.resetsAt)}.`
         : `You've used ${Math.round(w.pct)}% of your Gemini ${label.toLowerCase()}. Resets in ${fmtReset(w.resetsAt)}.`;
-      await notify("gum-" + key + "-" + t, `Gemini ${label}: ${Math.round(w.pct)}%`, msg);
+      await notify("gum-" + (CURRENT_ACCT || "a") + "-" + key + "-" + t, `Gemini ${label}: ${Math.round(w.pct)}%`, msg);
       fired[key] = done.concat(due);
       changed = true;
     }
     const f = forecast && forecast[scope];
     const fkey = key + ":fc";
     if (settings.forecastNotify && f && f.msLeft <= FC_NOTIFY_MIN * 60000 && !fired[fkey]) {
-      await notify("gum-" + fkey, `Gemini ${label}: ~${Math.max(1, Math.round(f.msLeft / 60000))}m left at this pace`,
-        `At your current pace you'll hit the ${label.toLowerCase()} before it resets in ${fmtReset(w.resetsAt)}.`);
+      await notify(
+        "gum-" + (CURRENT_ACCT || "a") + "-" + fkey,
+        `Gemini ${label}: ~${Math.max(1, Math.round(f.msLeft / 60000))}m left at this pace`,
+        `At your current pace you'll hit the ${label.toLowerCase()} before it resets in ${fmtReset(w.resetsAt)}.`
+      );
       fired[fkey] = [1];
       changed = true;
     }
@@ -338,36 +667,116 @@ function levelColor(p) {
   if (p >= 50) return "#f59e0b";
   return "#3b82f6";
 }
+function computeBadge(usage, settings) {
+  let p = null;
+  if (settings.badge !== "off" && usage) {
+    const c = usage.compute;
+    if (c) {
+      if (settings.badge === "short") p = c.short && c.short.pct;
+      else if (settings.badge === "weekly") p = c.weekly && c.weekly.pct;
+      else p = Math.max((c.short && c.short.pct) || 0, (c.weekly && c.weekly.pct) || 0);
+    } else {
+      const t = topCounter(usage);
+      if (t && t.pct > 0) p = t.pct;
+    }
+  }
+  if (p == null) return { text: "" };
+  return { text: p >= 100 ? "MAX" : String(Math.round(p)), color: levelColor(p) };
+}
+
+async function paintBadge(b, tabId) {
+  const t = tabId == null ? {} : { tabId };
+  await chrome.action.setBadgeText({ ...t, text: b.text });
+  if (!b.text) return;
+  await chrome.action.setBadgeBackgroundColor({ ...t, color: b.color });
+  if (chrome.action.setBadgeTextColor) await chrome.action.setBadgeTextColor({ ...t, color: "#ffffff" });
+}
+
+// v1.0.3: Because two tabs in the SAME window can be signed in to different
+// Google accounts, each Gemini tab with a known account gets its own tab-specific
+// badge, and the global badge reflects the default window's active account.
 async function updateBadge(usage, settings) {
+  const ctx = CTX;
+  const acct = CURRENT_ACCT;
   try {
-    let p = null;
-    if (settings.badge !== "off" && usage) {
-      const c = usage.compute;
-      if (c) {
-        if (settings.badge === "short") p = c.short && c.short.pct;
-        else if (settings.badge === "weekly") p = c.weekly && c.weekly.pct;
-        else p = Math.max((c.short && c.short.pct) || 0, (c.weekly && c.weekly.pct) || 0);
-      } else {
-        const t = topCounter(usage);
-        if (t && t.pct > 0) p = t.pct;
+    const b = computeBadge(usage, settings);
+    if (ctx === "default") {
+      await paintBadge(b);
+    }
+    const allTabs = await chrome.tabs.query({});
+    for (const t of allTabs) {
+      if (t.id == null) continue;
+      const tCtx = ctxOfTab(t);
+      const tAcct = TAB_STATE.get(t.id) && TAB_STATE.get(t.id).acct;
+      if (acct && tAcct === acct) {
+        try { await paintBadge(b, t.id); } catch (_) {}
+      } else if (!tAcct && tCtx === ctx && ctx !== "default") {
+        try { await paintBadge(b, t.id); } catch (_) {}
       }
     }
-    if (p == null) { await chrome.action.setBadgeText({ text: "" }); return; }
-    const txt = p >= 100 ? "MAX" : String(Math.round(p));
-    await chrome.action.setBadgeText({ text: txt });
-    await chrome.action.setBadgeBackgroundColor({ color: levelColor(p) });
-    if (chrome.action.setBadgeTextColor) await chrome.action.setBadgeTextColor({ color: "#ffffff" });
   } catch (_) {}
+}
+
+async function refreshOtherBadges(settings, exceptCtx) {
+  try {
+    const allTabs = await chrome.tabs.query({});
+    for (const t of allTabs) {
+      if (t.id == null) continue;
+      const tAcct = TAB_STATE.get(t.id) && TAB_STATE.get(t.id).acct;
+      if (tAcct) {
+        const u = await getLocal(`acct:${tAcct}:${BASE_K.usage}`, null);
+        try { await paintBadge(computeBadge(u, settings), t.id); } catch (_) {}
+      }
+    }
+    for (const c of await activeCtxs()) {
+      if (c === exceptCtx) continue;
+      inCtx(c, async () => {
+        await updateBadge(await getLocal(K.usage, null), settings);
+      });
+    }
+  } catch (_) {}
+}
+
+async function refreshTabBadge(tab) {
+  try {
+    if (!tab || tab.id == null) return;
+    await ensureTabStateLoaded();
+    const ctx = ctxOfTab(tab);
+    const tAcct = TAB_STATE.get(tab.id) && TAB_STATE.get(tab.id).acct;
+    if (!tAcct && ctx === "default") return;
+    await inCtx(ctx, async () => {
+      try {
+        await paintBadge(computeBadge(await getLocal(K.usage, null), await getSettings()), tab.id);
+      } catch (_) {}
+    }, { tabId: tab.id, acct: tAcct || null });
+  } catch (_) {}
+}
+
+if (chrome.tabs && chrome.tabs.onActivated) {
+  chrome.tabs.onActivated.addListener(({ tabId }) => {
+    chrome.tabs.get(tabId).then(async (tab) => {
+      await ensureTabStateLoaded();
+      const st = TAB_STATE.get(tabId);
+      if (st && st.acct) {
+        const ctx = ctxOfTab(tab);
+        LAST_ACCT_BY_CTX.set(ctx, st.acct);
+        await setLocal({ [windowKey(ctx, BASE_K.acct)]: st.acct });
+        if (ctx === "default") {
+          const u = await getLocal(`acct:${st.acct}:${BASE_K.usage}`, null);
+          await paintBadge(computeBadge(u, await getSettings()));
+        }
+      }
+      await refreshTabBadge(tab);
+    }).catch(() => {});
+  });
+  chrome.tabs.onUpdated.addListener((_id, info, tab) => {
+    if (info.status === "complete" || info.status === "loading") refreshTabBadge(tab);
+  });
 }
 
 // ---- fetching: via an open Gemini tab ---------------------------------------
 async function geminiTabs() {
   try { return await chrome.tabs.query({ url: GEMINI_ORIGIN + "/*" }); } catch (_) { return []; }
-}
-
-function authOfUrl(url) {
-  const m = /^https:\/\/gemini\.google\.com\/u\/(\d+)(?:\/|$)/.exec(url || "");
-  return m ? Number(m[1]) : 0;
 }
 
 function sendToTab(tabId, msg, timeoutMs) {
@@ -385,23 +794,55 @@ function sendToTab(tabId, msg, timeoutMs) {
   });
 }
 
-async function fetchViaTab(preferAuth) {
-  const tabs = await geminiTabs();
-  if (!tabs.length) return null;
-  tabs.sort((a, b) => {
-    const ma = authOfUrl(a.url) === preferAuth ? 1 : 0, mb = authOfUrl(b.url) === preferAuth ? 1 : 0;
-    if (ma !== mb) return mb - ma;
+// v1.0.3: pick the Gemini tab to ask: the one that was asked for, else one on
+// the wanted account, and always one of the SAME window (jar) as the job, so a
+// private window is read through its own tab and never through a normal one.
+// Matched by account id only.
+async function fetchViaTab(targetTabId, preferAcct) {
+  const ctx = CTX;
+  const allInCtx = (await geminiTabs()).filter((t) => ctxOfTab(t) === ctx);
+  if (!allInCtx.length) return null;
+
+  let candidates;
+  if (targetTabId != null) {
+    const exact = allInCtx.filter((t) => t.id === targetTabId);
+    candidates = exact.length ? exact : allInCtx;
+  } else if (preferAcct) {
+    const matching = allInCtx.filter((t) => (TAB_STATE.get(t.id) && TAB_STATE.get(t.id).acct) === preferAcct);
+    candidates = matching.length ? matching : allInCtx;
+  } else {
+    candidates = allInCtx;
+  }
+
+  candidates.sort((a, b) => {
+    if (targetTabId != null) {
+      if (a.id === targetTabId) return -1;
+      if (b.id === targetTabId) return 1;
+    }
+    if (preferAcct) {
+      const ma = (TAB_STATE.get(a.id) && TAB_STATE.get(a.id).acct) === preferAcct ? 1 : 0;
+      const mb = (TAB_STATE.get(b.id) && TAB_STATE.get(b.id).acct) === preferAcct ? 1 : 0;
+      if (ma !== mb) return mb - ma;
+    }
     if (a.active !== b.active) return a.active ? -1 : 1;
     return (b.lastAccessed || 0) - (a.lastAccessed || 0);
   });
+
   let lastErr = null;
-  for (const tab of tabs.slice(0, 3)) {
+  for (const tab of candidates.slice(0, 3)) {
     const r = await sendToTab(tab.id, { type: "fetch_quota" }, TAB_FETCH_TIMEOUT_MS);
     if (r && Array.isArray(r.rows)) {
-      return { rows: r.rows, complete: !!r.complete, authuser: r.authuser != null ? r.authuser : authOfUrl(tab.url), source: "tab" };
+      if (r.acct && r.rpc && ctxOfTab(tab) === "default") await rememberRpc(r.acct, r.rpc);
+      return {
+        rows: r.rows,
+        complete: !!r.complete,
+        acct: r.acct || (TAB_STATE.get(tab.id) && TAB_STATE.get(tab.id).acct) || null,
+        tabId: tab.id,
+        source: "tab"
+      };
     }
     lastErr = (r && r.error) || "empty";
-    if (lastErr === "signed_out") return { error: "signed_out" };
+    if (lastErr === "signed_out") return { error: "signed_out", tabId: tab.id };
   }
   return { error: lastErr || "tab_failed" };
 }
@@ -435,21 +876,57 @@ async function installOriginRule() {
   }
 }
 
-function prefixFor(authuser) { return authuser ? "/u/" + authuser : ""; }
+// v1.0.3: the worker's own request carries the NORMAL window's cookies, so /app
+// is the account that window is on. The call tokens and the 21-digit Google
+// user id (S06Grb) come out of that one document, so they can't disagree.
+// Tokens are cached per account (acct:<id>:bg_tokens).
+// The worker's own fallback request can only reach the NORMAL window's session, and to read an account that
+// is not the default one it has to address it by position. The account's page in that window reports its RPC
+// base ("/u/1/_/BardChatUi"); it is kept per account (21-digit id) and used ONLY as an address. It never says
+// whose data comes back: the S06Grb of the fresh /app response does, and the reading is filed under that.
+const RPC_BY_ACCT = new Map();
+const validRpc = (r) => typeof r === "string" && /^\/(?:u\/\d{1,2}\/)?_\/BardChatUi$/.test(r);
+async function rememberRpc(acct, rpc) {
+  if (!acct || !validRpc(rpc) || RPC_BY_ACCT.get(acct) === rpc) return;
+  RPC_BY_ACCT.set(acct, rpc);
+  await setLocal({ ["acct:" + acct + ":rpc_base"]: rpc });
+}
+async function rpcFor(acct) {
+  if (!acct) return null;
+  if (RPC_BY_ACCT.has(acct)) return RPC_BY_ACCT.get(acct);
+  const v = await getLocal("acct:" + acct + ":rpc_base", null);
+  if (!validRpc(v)) return null;
+  RPC_BY_ACCT.set(acct, v);
+  return v;
+}
+async function forgetRpc(acct) {
+  if (!acct) return;
+  RPC_BY_ACCT.delete(acct);
+  await chrome.storage.local.remove("acct:" + acct + ":rpc_base");
+}
 
-async function getTokens(authuser, force) {
-  const cache = await getLocal(K.tokens, {});
-  const c = cache[authuser];
-  if (!force && c && Date.now() - c.at < TOKENS_TTL_MS) return c;
-  const res = await fetch(GEMINI_ORIGIN + prefixFor(authuser) + "/app", { credentials: "include", redirect: "follow" });
+async function getTokens(force, rpc) {
+  if (!force && CURRENT_ACCT) {
+    const cached = await getLocal(K.tokens, null);
+    if (cached && cached.xsrf && cached.acct !== undefined && Date.now() - cached.at < TOKENS_TTL_MS) {
+      return cached;
+    }
+  }
+  const prefix = validRpc(rpc) ? rpc.replace(/\/_\/BardChatUi$/, "") : "";   // "" (default account) or "/u/N"
+  const res = await guardedFetch(GEMINI_ORIGIN + prefix + "/app", { credentials: "include", redirect: "follow" });
   if (!res.ok) throw new Error("http_" + res.status);
   if (/accounts\.google\.com/.test(res.url)) throw new Error("signed_out");
   const html = await res.text();
   const grab = (k) => { const m = new RegExp('"' + k + '":"([^"]*)"').exec(html); return m ? m[1] : null; };
-  const t = { at: Date.now(), xsrf: grab("SNlM0e"), bl: grab("cfb2h"), sid: grab("FdrFJe") };
+  // rpc: the batchexecute base of this very document (Im6cmf), so the calls go to the session the tokens belong to
+  const rpcRaw = (grab("Im6cmf") || "").replace(/\\\//g, "/").replace(/\/+$/, "");
+  const t = { at: Date.now(), xsrf: grab("SNlM0e"), bl: grab("cfb2h"), sid: grab("FdrFJe"), acct: grab("S06Grb"),
+              rpc: validRpc(rpcRaw) ? rpcRaw : (prefix ? prefix + "/_/BardChatUi" : null) };
   if (!t.xsrf) throw new Error("signed_out");
-  cache[authuser] = t;
-  await setLocal({ [K.tokens]: cache });
+  // the worker reads the normal window's default account: that says nothing about the account of the TAB that asked
+  if (t.acct) await setCurrentAcct(t.acct, null);
+  if (t.acct && t.rpc) await rememberRpc(t.acct, t.rpc);   // the address that really reached this account just now
+  await setLocal({ [K.tokens]: t });
   return t;
 }
 
@@ -471,13 +948,13 @@ function parseBatch(text) {
 }
 
 let bgReq = Math.floor(Math.random() * 9000) + 1000;
-async function bgCall(authuser, tokens, args) {
+async function bgCall(tokens, args) {
   const qs = new URLSearchParams({
     rpcids: RPC_QUOTA, "source-path": "/app", bl: tokens.bl || "", "f.sid": tokens.sid || "",
     hl: "en", _reqid: String((bgReq += 100000)), rt: "c"
   });
   const body = new URLSearchParams({ "f.req": JSON.stringify([[[RPC_QUOTA, args, null, "generic"]]]), at: tokens.xsrf });
-  const res = await fetch(GEMINI_ORIGIN + prefixFor(authuser) + "/_/BardChatUi/data/batchexecute?" + qs, {
+  const res = await guardedFetch(GEMINI_ORIGIN + (tokens.rpc || "/_/BardChatUi") + "/data/batchexecute?" + qs, {
     method: "POST",
     credentials: "include",
     headers: { "content-type": "application/x-www-form-urlencoded;charset=UTF-8", "x-same-domain": "1" },
@@ -488,10 +965,21 @@ async function bgCall(authuser, tokens, args) {
   return parseBatch(await res.text());
 }
 
-async function fetchDirect(authuser) {
-  let tokens = await getTokens(authuser, false);
+async function fetchDirect(rpc) {
+  const want = CURRENT_ACCT;   // the account this poll is about (getTokens switches CURRENT_ACCT to what /app returns)
+  // Always a fresh /app, never cached tokens: its S06Grb is the check of whose session this address reaches RIGHT NOW
+  // (sessions can be re-ordered or signed out since the address was reported). The reading is filed under that id.
+  let tokens;
+  try {
+    tokens = await getTokens(true, rpc);
+  } catch (e) {
+    if (!rpc) throw e;
+    await forgetRpc(want);                 // that address leads nowhere any more: fall back to the default account
+    tokens = await getTokens(true, null);
+  }
+  if (rpc && want && tokens.acct && tokens.acct !== want) await forgetRpc(want);   // that address now belongs to someone else
   const run = async () => {
-    const [a, b] = await Promise.allSettled([bgCall(authuser, tokens, ARGS_COMPUTE), bgCall(authuser, tokens, ARGS_ALL)]);
+    const [a, b] = await Promise.allSettled([bgCall(tokens, ARGS_COMPUTE), bgCall(tokens, ARGS_ALL)]);
     if (a.status === "rejected" && b.status === "rejected") throw a.reason;
     const rows = [];
     let complete = true;
@@ -507,43 +995,67 @@ async function fetchDirect(authuser) {
     out = await run();
   } catch (e) {
     // stale XSRF token: refresh once
-    tokens = await getTokens(authuser, true);
+    tokens = await getTokens(true, tokens.rpc);
     out = await run();
   }
-  return { rows: out.rows, complete: out.complete, authuser, source: "background" };
+  return { rows: out.rows, complete: out.complete, acct: tokens.acct || null, source: "background" };
 }
 
 // ---- the poll ------------------------------------------------------------------
-let polling = null;
+async function pollUsage(reason, targetTabId) {
+  const myRun = RUN_ID;
+  const tabId = targetTabId !== undefined ? targetTabId : CURRENT_TAB;
+  let result = await fetchViaTab(tabId, CURRENT_ACCT);
 
-async function pollUsage(reason) {
-  if (polling) return polling;
-  polling = (async () => {
-    const page = await getLocal(K.page, {});
-    const prefer = page.authuser != null ? page.authuser : 0;
-    let result = await fetchViaTab(prefer);
-    if (!result || (result.error && result.error !== "signed_out")) {
-      try { result = await fetchDirect(prefer); }
-      catch (e) { result = { error: String((e && e.message) || e) }; }
+  if (CTX !== "default") {
+    // v1.0.3: the worker's own fetch carries the NORMAL window's cookies, so it
+    // is never used for another window: no tab there means no reading.
+    if (!result) {
+      CURRENT_ACCT = null;
+      LAST_ACCT_BY_CTX.delete(CTX);
+      await setLocal({ [K.acct]: null });
+      result = { error: "no_tab_for_context" };
     }
-    if (!result || result.error) {
-      const err = result ? result.error : "unknown";
-      await setLocal({ [K.lastError]: { at: Date.now(), error: /signed_out|auth_/.test(err) ? "signed_out" : err } });
-      await broadcast();
-      return;
-    }
-    await applyRows(result.rows, { source: result.source, authuser: result.authuser, full: !!result.complete });
-  })().finally(() => { polling = null; });
-  return polling;
+  } else if (!result || (result.error && result.error !== "signed_out")) {
+    try { result = await fetchDirect(await rpcFor(CURRENT_ACCT)); }
+    catch (e) { result = { error: String((e && e.message) || e) }; }
+  }
+
+  if (myRun && RUN_ID !== myRun) throw new Error("ctx_expired");
+
+  if (!result || result.error) {
+    const err = result ? result.error : "unknown";
+    await setLastErrorForCurrent({
+      at: Date.now(),
+      error: /signed_out|auth_/.test(err) ? "signed_out" : err
+    });
+    await broadcast();
+    return;
+  }
+
+  await applyRows(result.rows, {
+    source: result.source,
+    acct: result.acct,
+    // only a reading that CAME FROM a tab says anything about that tab's account; the worker's
+    // own fetch reads the normal window's default account, whichever tab asked for it
+    tabId: result.tabId != null ? result.tabId : null,
+    full: !!result.complete
+  });
 }
 
 async function applyRows(rows, meta) {
   const now = Date.now();
+  const tabId = meta && meta.tabId !== undefined ? meta.tabId : CURRENT_TAB;
+  const fallbackAcct = tabId != null ? `x-${CTX}-tab-${tabId}` : `x-${CTX}-0`;
+  await setCurrentAcct((meta && meta.acct) || CURRENT_ACCT || fallbackAcct, tabId);
+
   const prev = await getLocal(K.usage, null);
-  const usage = mergeUsage(prev, rows, meta, now);
+  const usage = mergeUsage(prev, rows, { ...meta, acct: CURRENT_ACCT }, now);
   const settings = await getSettings();
   usage.forecast = await updateForecast(usage, now);
-  await setLocal({ [K.usage]: usage, [K.lastError]: null });
+
+  await setLocal({ [K.usage]: usage });
+  await setLastErrorForCurrent(null);
   await updateBadge(usage, settings);
   await maybeNotify(usage, usage.forecast, settings);
   await broadcast();
@@ -551,11 +1063,20 @@ async function applyRows(rows, meta) {
 
 async function getState() {
   const [usage, settings, page, lastError, rated, dismissedUntil] = await Promise.all([
-    getLocal(K.usage, null), getSettings(), getLocal(K.page, {}), getLocal(K.lastError, null),
-    getLocal(K.rated, false), getLocal(K.dismissedUntil, 0)
+    CURRENT_ACCT ? getLocal(K.usage, null) : Promise.resolve(null),
+    getSettings(),
+    getPageInfoForCurrent(),
+    getLastErrorForCurrent(),
+    getLocal(K.rated, false),
+    getLocal(K.dismissedUntil, 0)
   ]);
   return {
-    usage, settings, page, lastError,
+    ctx: CTX,
+    acct: CURRENT_ACCT || null,
+    usage,
+    settings,
+    page,
+    lastError,
     topCounter: topCounter(usage),
     reviewUrl: rated ? null : reviewUrl(),
     dismissedUntil
@@ -564,9 +1085,30 @@ async function getState() {
 
 async function broadcast() {
   const state = await getState();
-  try { chrome.runtime.sendMessage({ type: "state", state }, () => void chrome.runtime.lastError); } catch (_) {}
+  try {
+    chrome.runtime.sendMessage({ type: "state", state }, () => void chrome.runtime.lastError);
+  } catch (_) {}
+
+  // v1.0.3: send this state only to tabs on the same Google account (even across
+  // windows), or to tabs of the same window that don't know their account yet.
+  const acct = CURRENT_ACCT;
+  const ctx = CTX;
+  const curTab = CURRENT_TAB;
   for (const tab of await geminiTabs()) {
-    try { chrome.tabs.sendMessage(tab.id, { type: "state", state }, () => void chrome.runtime.lastError); } catch (_) {}
+    const tCtx = ctxOfTab(tab);
+    const tAcct = TAB_STATE.get(tab.id) && TAB_STATE.get(tab.id).acct;
+    let shouldSend = false;
+    if (acct && tAcct) {
+      shouldSend = (tAcct === acct);
+    } else if (curTab != null && tab.id === curTab) {
+      shouldSend = true;
+    } else if (!tAcct && tCtx === ctx) {
+      shouldSend = true;
+    }
+    if (!shouldSend) continue;
+    try {
+      chrome.tabs.sendMessage(tab.id, { type: "state", state }, () => void chrome.runtime.lastError);
+    } catch (_) {}
   }
 }
 
@@ -587,46 +1129,81 @@ async function rescheduleAlarm() {
 }
 
 chrome.alarms.onAlarm.addListener((a) => {
-  if (a.name === POLL_ALARM) pollUsage("alarm").then(rescheduleAlarm);
+  if (a.name === POLL_ALARM) pollAll().then(rescheduleAlarm);
 });
 
 chrome.tabs.onUpdated.addListener((id, info, tab) => {
   if (info.status === "complete" && tab.url && tab.url.startsWith(GEMINI_ORIGIN)) rescheduleAlarm();
 });
-chrome.tabs.onRemoved.addListener(() => { rescheduleAlarm(); });
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (TAB_STATE.has(tabId)) {
+    TAB_STATE.delete(tabId);
+    persistTabState();
+  }
+  rescheduleAlarm();
+});
 
 // ---- messages ----------------------------------------------------------------------
-let genRefreshTimer = null;
+const genRefreshTimers = new Map();   // tabId (or ctx) -> pending refresh
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+function handleMessage(msg, sender, sendResponse) {
   (async () => {
+    // The tab a message is about: the one it came from, or (the popup is not a
+    // tab) the one the popup was opened on.
+    const senderTabId = (sender && sender.tab && sender.tab.id != null)
+      ? sender.tab.id
+      : (msg && typeof msg.tabId === "number" ? msg.tabId : null);
+
     switch (msg && msg.type) {
       case "get_state":
         return getState();
       case "refresh":
-        await pollUsage("manual");
+        await pollUsage("manual", senderTabId);
         return getState();
       case "quota_sniffed":
         if (Array.isArray(msg.rows) && msg.rows.length) {
-          await applyRows(msg.rows, { source: "page", authuser: msg.authuser || 0 });
+          await applyRows(msg.rows, {
+            source: "page",
+            acct: msg.acct || CURRENT_ACCT || null,
+            tabId: senderTabId
+          });
         }
         return { ok: true };
-      case "gen_done":
+      case "gen_done": {
         // A reply just finished; Gemini settles the quota a moment later.
-        clearTimeout(genRefreshTimer);
-        genRefreshTimer = setTimeout(() => pollUsage("gen_done"), 2500);
+        const c = CTX;
+        const acct = msg.acct || CURRENT_ACCT || null;
+        const timerKey = senderTabId != null ? `tab:${senderTabId}` : `ctx:${c}`;
+        clearTimeout(genRefreshTimers.get(timerKey));
+        genRefreshTimers.set(
+          timerKey,
+          setTimeout(() => inCtx(c, () => pollUsage("gen_done", senderTabId), { tabId: senderTabId, acct }), 2500)
+        );
         return { ok: true };
+      }
       case "page_info": {
-        const prev = await getLocal(K.page, {});
-        const next = Object.assign({}, prev, msg.info || {}, { at: Date.now() });
-        await setLocal({ [K.page]: next });
-        if (prev.authuser !== next.authuser) pollUsage("account_switch");
+        const prev = await getPageInfoForCurrent();
+        const incomingAcct = msg.acct || (msg.info && msg.info.acct) || null;
+        const prevAcct = prev.acct || CURRENT_ACCT || null;
+        if (incomingAcct) await setCurrentAcct(incomingAcct, senderTabId);
+        const next = Object.assign({}, prev, msg.info || {}, {
+          acct: incomingAcct || prevAcct || null,
+          at: Date.now()
+        });
+        await setPageInfoForCurrent(next);
+        if (incomingAcct && incomingAcct !== prevAcct) {
+          await pollUsage("account_switch", senderTabId);
+        } else {
+          await updateBadge(await getLocal(K.usage, null), await getSettings());
+          await broadcast();
+        }
         return { ok: true };
       }
       case "save_settings": {
         const s = await saveSettings(msg.patch || {});
         const usage = await getLocal(K.usage, null);
         await updateBadge(usage, s);
+        refreshOtherBadges(s, CTX);
         await rescheduleAlarm();
         await broadcast();
         return s;
@@ -637,8 +1214,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return { ok: true };
       }
       case "reset": {
-        await setLocal({ [K.fired]: {}, [K.dismissedUntil]: 0, [K.history]: {}, [K.tokens]: {} });
-        await pollUsage("reset");
+        await setLocal({ [K.fired]: {}, [K.dismissedUntil]: 0, [K.history]: {}, [K.tokens]: null });
+        await pollUsage("reset", senderTabId);
         return getState();
       }
       case "test_notification": {
@@ -663,14 +1240,70 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
   })().then(sendResponse, (e) => sendResponse({ error: String(e) }));
   return true;
+}
+
+// v1.0.3: every message runs inside the window and account of the tab it is
+// about, so the numbers it reads or writes are that account's.
+const CTX_FREE_MESSAGES = new Set(["open_options"]);
+
+async function resolveMessageTarget(msg, sender) {
+  if (sender && sender.tab) {
+    return {
+      ctx: ctxOfTab(sender.tab),
+      tabId: sender.tab.id,
+      // page_info is how a tab announces a (new) account: run it as the account
+      // the tab was on until now, so page_info can tell that it changed.
+      acct: msg.type === "page_info" ? null : (msg.acct || (msg.info && msg.info.acct) || null)
+    };
+  }
+  if (msg && typeof msg.tabId === "number") {
+    try {
+      const t = await chrome.tabs.get(msg.tabId);
+      if (t) {
+        return {
+          ctx: ctxOfTab(t),
+          tabId: t.id,
+          acct: msg.acct || (TAB_STATE.get(t.id) && TAB_STATE.get(t.id).acct) || null
+        };
+      }
+    } catch (_) {}
+  }
+  return { ctx: "default", tabId: null, acct: (msg && msg.acct) || null };
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || !msg.type) return;
+  if (CTX_FREE_MESSAGES.has(msg.type)) return handleMessage(msg, sender, sendResponse);
+  let replied = false;
+  const replyOnce = (v) => {
+    if (replied) return;
+    replied = true;
+    try { sendResponse(v); } catch (_) {}
+  };
+  (async () => {
+    const target = await resolveMessageTarget(msg, sender);
+    if (msg.acct && msg.rpc && target.ctx === "default") await rememberRpc(msg.acct, msg.rpc);
+    await inCtx(target.ctx, async () => {
+      await new Promise((resolve) => {
+        const reply = (v) => { replyOnce(v); resolve(); };
+        let ret;
+        try { ret = handleMessage(msg, sender, reply); } catch (_) { ret = undefined; }
+        if (ret !== true) { replyOnce(); resolve(); }
+      });
+    }, { tabId: target.tabId, acct: target.acct });
+  })().catch((err) => {
+    replyOnce({ error: (err && err.message) || "failed" });
+  });
+  return true;
 });
 
 // ---- lifecycle ----------------------------------------------------------------------
 async function boot() {
   await installOriginRule();
   await rescheduleAlarm();
-  const usage = await getLocal(K.usage, null);
-  await updateBadge(usage, await getSettings());
+  await inCtx("default", async () => {
+    await updateBadge(await getLocal(K.usage, null), await getSettings());
+  });
 }
 
 function isEdgeBrowser() {
@@ -728,10 +1361,16 @@ chrome.runtime.onInstalled.addListener(async (details) => {
   if (details.reason === "install" && INSTALL_URL) {
     try { chrome.tabs.create({ url: INSTALL_URL }); } catch (_) {}
   }
-  pollUsage("install");
+  pollAll();
 });
-chrome.runtime.onStartup.addListener(() => { setUninstallPage(); boot().then(() => pollUsage("startup")); });
+chrome.runtime.onStartup.addListener(() => {
+  setUninstallPage();
+  // Tab ids don't survive a browser restart, so what was remembered per tab is
+  // stale now. Each tab reports its account again as soon as it loads.
+  chrome.storage.local.remove("session_tabs").catch(() => {});
+  boot().then(() => pollAll());
+});
 setUninstallPage();
 
 // exported for tests (no-op in the extension)
-if (typeof module !== "undefined") module.exports = { parseRow, classifyCompute, mergeUsage, computeForecast, topCounter };
+if (typeof module !== "undefined") module.exports = { parseRow, classifyCompute, mergeUsage, computeForecast, topCounter, ctxOfTab };

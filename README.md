@@ -34,7 +34,7 @@ Gemini's own **Settings › Usage limits** page and its in-chat usage badge read
 2. **Listening in.** When Gemini fetches its quota for its own UI, the injector copies the rows (read-only, from a clone), so the meter moves when Gemini's own badge would. When a reply finishes (a `StreamGenerate` request closes), the worker re-reads usage 2.5 s later and the chat size is recounted.
 3. **No Gemini tab open (fallback).** The service worker reads the tokens out of `/app`, then calls `qpEbW` directly. A session `declarativeNetRequest` rule gives only those extension-initiated requests a `gemini.google.com` Origin. With no Gemini tab, polling slows to every 5 minutes.
 
-Multiple Google accounts are followed through the `/u/N/` path of the tab you're using.
+**Several accounts, normal window and incognito (v1.0.3).** An account is identified by the 21-digit Google user id (`WIZ_global_data.S06Grb`), read from the same page object (`page-injector.js`) or `/app` document (`background.js`) that supplies the call tokens. `/u/N` is never used to tell accounts apart. Usage, forecast history, fired alerts and background tokens are stored per account (`acct:<id>:...`), and each tab tracks the account it is signed in to, so two tabs of one window on different accounts, or a normal and a private window, never mix. A private window is read only through a Gemini tab of that window (the worker's own fetch always carries the normal window's cookies), and each tab is sent only its own account's numbers and toolbar badge. The extension must be allowed in private windows. `tests/jar-isolation.test.js` simulates this (`node tests/jar-isolation.test.js <extension folder>`).
 
 ## Chat size
 
@@ -51,6 +51,7 @@ Gemini-Usage-Meter/
 ├── overlay.css          Strip + popover styles (follows Gemini's light/dark theme)
 ├── popup/               Toolbar popup (+ tools drawer)
 ├── options/             Settings page
+├── tests/               jar-isolation.test.js (several accounts, normal vs private window; node, no dependencies)
 └── icons/               Gauge icons; icons/tools/ for the SelectorsHub menu
 ```
 

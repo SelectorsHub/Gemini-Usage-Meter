@@ -7,9 +7,20 @@
   let state = null;
   let showAllCounters = false;
 
-  function send(msg) {
+  // v1.0.3: the popup is not a tab, so it tells the worker which tab it was
+  // opened on. The worker then answers for THAT tab's Google account and
+  // window (normal or private), not for whichever account was read last.
+  async function myTabId() {
+    try {
+      const [t] = await chrome.tabs.query({ active: true, currentWindow: true });
+      return t ? t.id : undefined;
+    } catch (_) { return undefined; }
+  }
+
+  async function send(msg) {
+    const tabId = await myTabId();
     return new Promise((resolve) => {
-      try { chrome.runtime.sendMessage(msg, (r) => { void chrome.runtime.lastError; resolve(r); }); }
+      try { chrome.runtime.sendMessage(Object.assign({ tabId }, msg), (r) => { void chrome.runtime.lastError; resolve(r); }); }
       catch (_) { resolve(null); }
     });
   }
@@ -161,7 +172,6 @@
       pills.push("Plan: " + ((p.work ? "Workspace " : "") + (p.tier || (p.work ? "" : "Free"))).trim());
     }
     if (page && page.model) pills.push("Mode: " + page.model);
-    if (usage && usage.authuser) pills.push("Account /u/" + usage.authuser);
     if (usage && usage.kind === "none") pills.push("No limits reported");
     meta.textContent = "";
     for (const t of pills) { const s = document.createElement("span"); s.className = "pill"; s.textContent = t; meta.appendChild(s); }
@@ -233,7 +243,14 @@
   });
 
   chrome.runtime.onMessage.addListener((msg) => {
-    if (msg && msg.type === "state" && msg.state) { state = msg.state; render(); }
+    if (!msg || msg.type !== "state" || !msg.state) return;
+    // The worker broadcasts for every account; keep the one this popup shows.
+    if (state) {
+      if (state.acct && msg.state.acct && msg.state.acct !== state.acct) return;
+      if (state.ctx && msg.state.ctx && msg.state.ctx !== state.ctx) return;
+    }
+    state = msg.state;
+    render();
   });
 
   // first paint from cache, then a fresh fetch
